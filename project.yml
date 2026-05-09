@@ -1,0 +1,31 @@
+name: NovaHomeKit
+options:
+  bundleIdPrefix: net.digitalnoise
+  deploymentTarget:
+    iOS: "16.0"
+
+settings:
+  SWIFT_VERSION: "5.9"
+
+targets:
+  NovaHomeKit:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - Sources/NovaHomeKit
+    settings:
+      PRODUCT_NAME: NovaHomeKit
+      BUNDLE_IDENTIFIER: com.kochj.HomeKitTV
+      CODE_SIGN_ENTITLEMENTS: NovaHomeKit/NovaHomeKit.entitlements
+      CODE_SIGN_IDENTITY: "Apple Development"
+      CODE_SIGN_STYLE: Automatic
+      DEVELOPMENT_TEAM: QRRCB8HB3W
+      SUPPORTS_MACCATALYST: YES
+      DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: YES
+      INFOPLIST_KEY_NSHomeKitUsageDescription: "Nova reads HomeKit accessories to monitor your home."
+      INFOPLIST_KEY_UILaunchScreen_Generation: YES
+      INFOPLIST_KEY_LSUIElement: YES
+    dependencies:
+      - framework: HomeKit.framework
+        weak: false
