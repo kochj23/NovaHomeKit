@@ -6,7 +6,7 @@
 
 Lightweight HomeKit query server for Nova. Exposes a local HTTP API on port 37433 so Nova can read your HomeKit accessories, scenes, and room layout without launching a full app or doing a network scan.
 
-Runs as a headless macOS/Mac Catalyst background app — no UI, no menu bar icon. Nova queries it directly.
+Runs as a headless macOS/Mac Catalyst background app — no UI, no menu bar icon. Nova queries it directly from the Mac Studio M4 Ultra host.
 
 Written by Jordan Koch.
 
@@ -112,7 +112,7 @@ Returns all HomeKit accessories with room, service type, and characteristic valu
 
 ## How Nova Used It
 
-NovaControl proxied NovaHomeKit through its unified API at port 37400. That proxy layer is now the canonical implementation — the standalone app is retired.
+NovaControl proxied NovaHomeKit through its unified API at port 37400. That proxy layer is now the canonical implementation — the standalone app is retired. Nova's infrastructure (1,224,900 vectors across 409 domains in PostgreSQL 17 + pgvector) uses the HomeKit data for contextual awareness.
 
 ```bash
 # Recommended (NovaControl — works today)
@@ -126,7 +126,7 @@ Nova queries the HomeKit API when she needs to:
 - Report room temperatures and humidity
 - Check lock states and door sensors
 - Identify connected accessories for morning briefings
-- Trigger scene execution via the Shortcuts CLI proxy
+- Trigger scene execution via the Shortcuts CLI proxy (port 37432)
 
 ---
 
