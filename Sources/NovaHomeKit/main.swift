@@ -2,13 +2,16 @@ import Foundation
 import HomeKit
 import Network
 
-/// NovaHomeKit — Lightweight HomeKit query server for Nova.
-/// Exposes a local HTTP API on port 37433 so Nova can query HomeKit without
-/// launching HomekitControl or doing a network scan.
+/// NovaHomeKit — Lightweight HomeKit query + control server for Nova.
+/// Exposes a local HTTP API on port 37433 so Nova can query and drive HomeKit
+/// without launching HomekitControl or doing a network scan.
 ///
 /// Endpoints:
-///   GET /api/accessories  → JSON array of all accessories with room, services, characteristics
-///   GET /api/status       → health check
+///   GET  /api/accessories                         → JSON array: room, services, characteristics (+values)
+///   GET  /api/status                              → health check
+///   GET  /api/scenes                              → JSON array of HomeKit scene (action set) names
+///   GET|POST /api/scenes/execute?name=<scene>     → run a HomeKit scene via executeActionSet
+///   GET|POST /api/accessories/power?name=<n>&on=<true|false> → set an accessory's Power State
 ///
 /// Written by Jordan Koch.
 
@@ -19,7 +22,6 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
     private let manager = HMHomeManager()
     private var listener: NWListener?
     private var homesReady = false
-    private var cachedAccessoriesJSON = "[]"
 
     override init() {
         super.init()
@@ -34,18 +36,7 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
 
     func homeManagerDidUpdateHomes(_ manager: HMHomeManager) {
         homesReady = true
-        let allAccessories = manager.homes.flatMap { $0.accessories }
-        NSLog("[NovaHomeKit] HomeKit ready: \(manager.homes.count) home(s), \(allAccessories.count) accessories")
-
-        let names = allAccessories.map { $0.name }
-        let jsonStr = "[" + names.map { name in
-            let escaped = name.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-            return "\"\(escaped)\""
-        }.joined(separator: ",") + "]"
-
-        cachedAccessoriesJSON = jsonStr
-        try? jsonStr.write(toFile: "/tmp/novahomekit_accessories.json", atomically: true, encoding: .utf8)
-        NSLog("[NovaHomeKit] Cache: \(names.count) names, \(jsonStr.count) bytes")
+        NSLog("[NovaHomeKit] HomeKit ready: \(manager.homes.count) home(s), \(manager.homes.flatMap { $0.accessories }.count) accessories")
     }
 
     // MARK: - HTTP Server
@@ -53,7 +44,8 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
     private func startHTTP() {
         do {
             let params = NWParameters.tcp
-            listener = try NWListener(using: params, on: 37433)
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: 37433)
+            listener = try NWListener(using: params)
             listener?.newConnectionHandler = { [weak self] conn in self?.handle(conn) }
             listener?.stateUpdateHandler = { state in
                 if case .ready = state { NSLog("[NovaHomeKit] HTTP server ready on port 37433") }
@@ -65,9 +57,6 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
     }
 
     private func handle(_ conn: NWConnection) {
-        conn.stateUpdateHandler = { state in
-            if case .failed = state { conn.cancel() }
-        }
         conn.start(queue: .main)
         receive(conn, Data())
     }
@@ -77,13 +66,8 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
             var b = buf
             if let d = data { b.append(d) }
             if let req = Self.parseRequest(b) {
-                guard let resp = self?.route(req), let respData = resp.data(using: .utf8) else {
-                    conn.cancel()
-                    return
-                }
-                conn.send(content: respData, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in
-                    // finalMessage signals EOF to the TCP stack — client will see connection close
-                })
+                let resp = self?.route(req) ?? self?.http(503, "Not ready")
+                conn.send(content: resp?.data(using: .utf8), completion: .contentProcessed { _ in conn.cancel() })
             } else if !done {
                 self?.receive(conn, b)
             } else {
@@ -102,9 +86,52 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
             return json(200, ["status": "ok", "app": "NovaHomeKit", "port": 37433, "homesReady": homesReady, "accessoryCount": manager.homes.flatMap { $0.accessories }.count] as [String: Any])
 
         case ("GET", "/api/accessories"):
-            return http(200, cachedAccessoriesJSON, "application/json")
+            if !homesReady {
+                return json(200, ["accessories": [], "note": "HomeKit still initializing"] as [String: Any])
+            }
+            var result: [[String: Any]] = []
+            for home in manager.homes {
+                let roomMap: [UUID: String] = {
+                    var m: [UUID: String] = [:]
+                    for room in home.rooms {
+                        for acc in room.accessories { m[acc.uniqueIdentifier] = room.name }
+                    }
+                    return m
+                }()
+                for acc in home.accessories {
+                    let services = acc.services.map { svc -> [String: Any] in
+                        let chars = svc.characteristics.map { c -> [String: Any] in
+                            var entry: [String: Any] = ["type": c.localizedDescription, "uuid": c.characteristicType]
+                            // Guard against non-JSON-serializable values (e.g. Data/custom on FP2
+                            // sensors) — those raise an NSException in JSONSerialization and crash
+                            // the whole server. Pass primitives through; stringify anything else.
+                            if let v = c.value {
+                                if v is String || v is NSNumber {
+                                    entry["value"] = v
+                                } else {
+                                    entry["value"] = String(describing: v)
+                                }
+                            }
+                            return entry
+                        }
+                        return ["type": svc.serviceType, "name": svc.name, "characteristics": chars]
+                    }
+                    result.append([
+                        "name": acc.name,
+                        "room": roomMap[acc.uniqueIdentifier] ?? "Unknown",
+                        "home": home.name,
+                        "reachable": acc.isReachable,
+                        "services": services
+                    ] as [String: Any])
+                }
+            }
+            guard let data = try? JSONSerialization.data(withJSONObject: result, options: .prettyPrinted),
+                  let body = String(data: data, encoding: .utf8) else {
+                return http(500, "JSON error")
+            }
+            return http(200, body, "application/json")
 
-        // List all HomeKit scenes (action sets) by name.
+        // List HomeKit scenes (action sets) by name.
         case ("GET", "/api/scenes"):
             let names = manager.homes.flatMap { $0.actionSets }.map { $0.name }
             let body = "[" + names.map { "\"\(jsonEscape($0))\"" }.joined(separator: ",") + "]"
@@ -122,7 +149,7 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
                 }) {
                     home.executeActionSet(set) { error in
                         if let error = error {
-                            NSLog("[NovaHomeKit] executeActionSet '\(name)' failed: \(error.localizedDescription)")
+                            NSLog("[NovaHomeKit] scene '\(name)' failed: \(error.localizedDescription)")
                         } else {
                             NSLog("[NovaHomeKit] executed scene '\(name)'")
                         }
@@ -131,6 +158,38 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
                 }
             }
             return json(404, ["error": "scene not found: \(name)"] as [String: Any])
+
+        // Power an accessory on/off by name: /api/accessories/power?name=<accessory>&on=<true|false>
+        case ("GET", "/api/accessories/power"), ("POST", "/api/accessories/power"):
+            guard let name = Self.queryValue(query, "name"), !name.isEmpty else {
+                return json(400, ["error": "missing ?name="] as [String: Any])
+            }
+            let on = (Self.queryValue(query, "on") ?? "true").lowercased() != "false"
+            let target = name.folding(options: .caseInsensitive, locale: nil)
+            var found = false
+            // Match by accessory name OR by outlet/service name (power strips expose each
+            // outlet as a named service, e.g. "Bug Zapper", "TV, Stereo, Apple TV").
+            for home in manager.homes {
+                for acc in home.accessories {
+                    let accMatch = acc.name.folding(options: .caseInsensitive, locale: nil) == target
+                    for svc in acc.services {
+                        let svcMatch = svc.name.folding(options: .caseInsensitive, locale: nil) == target
+                        guard accMatch || svcMatch else { continue }
+                        for c in svc.characteristics where c.characteristicType == HMCharacteristicTypePowerState {
+                            found = true
+                            c.writeValue(on) { error in
+                                if let error = error {
+                                    NSLog("[NovaHomeKit] power '\(name)'=\(on) failed: \(error.localizedDescription)")
+                                } else {
+                                    NSLog("[NovaHomeKit] set '\(name)' power=\(on)")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return found ? json(200, ["status": "ok", "accessory": name, "on": on] as [String: Any])
+                         : json(404, ["error": "no powerable accessory named: \(name)"] as [String: Any])
 
         default:
             return json(404, ["error": "Not found: \(req.method) \(path)"] as [String: Any])
