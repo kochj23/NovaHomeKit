@@ -19,6 +19,7 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
     private let manager = HMHomeManager()
     private var listener: NWListener?
     private var homesReady = false
+    private var cachedAccessoriesJSON = "[]"
 
     override init() {
         super.init()
@@ -33,7 +34,18 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
 
     func homeManagerDidUpdateHomes(_ manager: HMHomeManager) {
         homesReady = true
-        NSLog("[NovaHomeKit] HomeKit ready: \(manager.homes.count) home(s), \(manager.homes.flatMap { $0.accessories }.count) accessories")
+        let allAccessories = manager.homes.flatMap { $0.accessories }
+        NSLog("[NovaHomeKit] HomeKit ready: \(manager.homes.count) home(s), \(allAccessories.count) accessories")
+
+        let names = allAccessories.map { $0.name }
+        let jsonStr = "[" + names.map { name in
+            let escaped = name.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(escaped)\""
+        }.joined(separator: ",") + "]"
+
+        cachedAccessoriesJSON = jsonStr
+        try? jsonStr.write(toFile: "/tmp/novahomekit_accessories.json", atomically: true, encoding: .utf8)
+        NSLog("[NovaHomeKit] Cache: \(names.count) names, \(jsonStr.count) bytes")
     }
 
     // MARK: - HTTP Server
@@ -41,8 +53,7 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
     private func startHTTP() {
         do {
             let params = NWParameters.tcp
-            params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: 37433)
-            listener = try NWListener(using: params)
+            listener = try NWListener(using: params, on: 37433)
             listener?.newConnectionHandler = { [weak self] conn in self?.handle(conn) }
             listener?.stateUpdateHandler = { state in
                 if case .ready = state { NSLog("[NovaHomeKit] HTTP server ready on port 37433") }
@@ -54,6 +65,9 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
     }
 
     private func handle(_ conn: NWConnection) {
+        conn.stateUpdateHandler = { state in
+            if case .failed = state { conn.cancel() }
+        }
         conn.start(queue: .main)
         receive(conn, Data())
     }
@@ -63,8 +77,13 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
             var b = buf
             if let d = data { b.append(d) }
             if let req = Self.parseRequest(b) {
-                let resp = self?.route(req) ?? self?.http(503, "Not ready")
-                conn.send(content: resp?.data(using: .utf8), completion: .contentProcessed { _ in conn.cancel() })
+                guard let resp = self?.route(req), let respData = resp.data(using: .utf8) else {
+                    conn.cancel()
+                    return
+                }
+                conn.send(content: respData, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { _ in
+                    // finalMessage signals EOF to the TCP stack — client will see connection close
+                })
             } else if !done {
                 self?.receive(conn, b)
             } else {
@@ -74,50 +93,63 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
     }
 
     private func route(_ req: (method: String, path: String)) -> String {
-        switch (req.method, req.path) {
+        let parts = req.path.components(separatedBy: "?")
+        let path = parts.first ?? req.path
+        let query = parts.count > 1 ? parts[1] : ""
+
+        switch (req.method, path) {
         case ("GET", "/api/status"):
             return json(200, ["status": "ok", "app": "NovaHomeKit", "port": 37433, "homesReady": homesReady, "accessoryCount": manager.homes.flatMap { $0.accessories }.count] as [String: Any])
 
         case ("GET", "/api/accessories"):
-            if !homesReady {
-                return json(200, ["accessories": [], "note": "HomeKit still initializing"] as [String: Any])
-            }
-            var result: [[String: Any]] = []
-            for home in manager.homes {
-                let roomMap: [UUID: String] = {
-                    var m: [UUID: String] = [:]
-                    for room in home.rooms {
-                        for acc in room.accessories { m[acc.uniqueIdentifier] = room.name }
-                    }
-                    return m
-                }()
-                for acc in home.accessories {
-                    let services = acc.services.map { svc -> [String: Any] in
-                        let chars = svc.characteristics.map { c -> [String: Any] in
-                            var entry: [String: Any] = ["type": c.localizedDescription, "uuid": c.characteristicType]
-                            if let v = c.value { entry["value"] = v }
-                            return entry
-                        }
-                        return ["type": svc.serviceType, "name": svc.name, "characteristics": chars]
-                    }
-                    result.append([
-                        "name": acc.name,
-                        "room": roomMap[acc.uniqueIdentifier] ?? "Unknown",
-                        "home": home.name,
-                        "reachable": acc.isReachable,
-                        "services": services
-                    ] as [String: Any])
-                }
-            }
-            guard let data = try? JSONSerialization.data(withJSONObject: result, options: .prettyPrinted),
-                  let body = String(data: data, encoding: .utf8) else {
-                return http(500, "JSON error")
-            }
+            return http(200, cachedAccessoriesJSON, "application/json")
+
+        // List all HomeKit scenes (action sets) by name.
+        case ("GET", "/api/scenes"):
+            let names = manager.homes.flatMap { $0.actionSets }.map { $0.name }
+            let body = "[" + names.map { "\"\(jsonEscape($0))\"" }.joined(separator: ",") + "]"
             return http(200, body, "application/json")
 
+        // Execute a HomeKit scene by name: /api/scenes/execute?name=<scene>
+        case ("GET", "/api/scenes/execute"), ("POST", "/api/scenes/execute"):
+            guard let name = Self.queryValue(query, "name"), !name.isEmpty else {
+                return json(400, ["error": "missing ?name="] as [String: Any])
+            }
+            let target = name.folding(options: .caseInsensitive, locale: nil)
+            for home in manager.homes {
+                if let set = home.actionSets.first(where: {
+                    $0.name.folding(options: .caseInsensitive, locale: nil) == target
+                }) {
+                    home.executeActionSet(set) { error in
+                        if let error = error {
+                            NSLog("[NovaHomeKit] executeActionSet '\(name)' failed: \(error.localizedDescription)")
+                        } else {
+                            NSLog("[NovaHomeKit] executed scene '\(name)'")
+                        }
+                    }
+                    return json(200, ["status": "executed", "scene": name] as [String: Any])
+                }
+            }
+            return json(404, ["error": "scene not found: \(name)"] as [String: Any])
+
         default:
-            return json(404, ["error": "Not found: \(req.method) \(req.path)"] as [String: Any])
+            return json(404, ["error": "Not found: \(req.method) \(path)"] as [String: Any])
         }
+    }
+
+    private func jsonEscape(_ s: String) -> String {
+        return s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private static func queryValue(_ query: String, _ key: String) -> String? {
+        for pair in query.components(separatedBy: "&") {
+            let kv = pair.components(separatedBy: "=")
+            if kv.count == 2 && kv[0] == key {
+                let v = kv[1].replacingOccurrences(of: "+", with: " ")
+                return v.removingPercentEncoding ?? v
+            }
+        }
+        return nil
     }
 
     private func json(_ status: Int, _ d: [String: Any]) -> String {
@@ -136,7 +168,7 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
               let firstLine = raw.components(separatedBy: "\r\n").first else { return nil }
         let tokens = firstLine.components(separatedBy: " ")
         guard tokens.count >= 2 else { return nil }
-        return (tokens[0], tokens[1].components(separatedBy: "?").first ?? tokens[1])
+        return (tokens[0], tokens[1])
     }
 }
 
