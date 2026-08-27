@@ -76,7 +76,16 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
         }
     }
 
-    private func route(_ req: (method: String, path: String)) -> String {
+    private func route(_ req: (method: String, path: String, headers: [String: String])) -> String {
+        // DNS-rebinding protection: only serve loopback-addressed requests.
+        guard Self.isAllowedHost(req.headers["host"]) else {
+            return json(403, ["error": "forbidden host"] as [String: Any])
+        }
+        // Require the shared secret on every request.
+        guard Self.authorized(req.headers["authorization"]) else {
+            return json(401, ["error": "unauthorized"] as [String: Any])
+        }
+
         let parts = req.path.components(separatedBy: "?")
         let path = parts.first ?? req.path
         let query = parts.count > 1 ? parts[1] : ""
@@ -138,7 +147,8 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
             return http(200, body, "application/json")
 
         // Execute a HomeKit scene by name: /api/scenes/execute?name=<scene>
-        case ("GET", "/api/scenes/execute"), ("POST", "/api/scenes/execute"):
+        // State-changing → POST only (GET would be CSRF-able from a web page).
+        case ("POST", "/api/scenes/execute"):
             guard let name = Self.queryValue(query, "name"), !name.isEmpty else {
                 return json(400, ["error": "missing ?name="] as [String: Any])
             }
@@ -160,7 +170,8 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
             return json(404, ["error": "scene not found: \(name)"] as [String: Any])
 
         // Power an accessory on/off by name: /api/accessories/power?name=<accessory>&on=<true|false>
-        case ("GET", "/api/accessories/power"), ("POST", "/api/accessories/power"):
+        // State-changing → POST only (GET would be CSRF-able from a web page).
+        case ("POST", "/api/accessories/power"):
             guard let name = Self.queryValue(query, "name"), !name.isEmpty else {
                 return json(400, ["error": "missing ?name="] as [String: Any])
             }
@@ -218,16 +229,62 @@ class HomeKitQueryServer: NSObject, HMHomeManagerDelegate {
     }
 
     private func http(_ status: Int, _ body: String, _ ct: String = "text/plain") -> String {
-        let statusText = [200: "OK", 404: "Not Found", 500: "Internal Server Error", 503: "Service Unavailable"][status] ?? "Unknown"
-        return "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: \(ct); charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n\(body)"
+        let statusText = [200: "OK", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 500: "Internal Server Error", 503: "Service Unavailable"][status] ?? "Unknown"
+        return "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: \(ct); charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
     }
 
-    private static func parseRequest(_ data: Data) -> (method: String, path: String)? {
-        guard let raw = String(data: data, encoding: .utf8), raw.contains("\r\n\r\n"),
-              let firstLine = raw.components(separatedBy: "\r\n").first else { return nil }
+    private static func parseRequest(_ data: Data) -> (method: String, path: String, headers: [String: String])? {
+        guard let raw = String(data: data, encoding: .utf8), raw.contains("\r\n\r\n") else { return nil }
+        let lines = raw.components(separatedBy: "\r\n")
+        guard let firstLine = lines.first else { return nil }
         let tokens = firstLine.components(separatedBy: " ")
         guard tokens.count >= 2 else { return nil }
-        return (tokens[0], tokens[1])
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            if line.isEmpty { break }
+            guard let idx = line.firstIndex(of: ":") else { continue }
+            let k = String(line[..<idx]).lowercased().trimmingCharacters(in: .whitespaces)
+            let v = String(line[line.index(after: idx)...]).trimmingCharacters(in: .whitespaces)
+            headers[k] = v
+        }
+        return (tokens[0], tokens[1], headers)
+    }
+
+    // MARK: - Authentication
+
+    // Loopback is not an auth boundary — any web page the user visits can POST to
+    // 127.0.0.1. Every request must carry the shared secret, and the Host header must
+    // be a loopback name (DNS-rebinding guard). The token is provisioned out-of-band
+    // (env var or installer-written file); if unset we fail closed.
+    private static let expectedToken: String = {
+        if let env = ProcessInfo.processInfo.environment["NOVAHOMEKIT_TOKEN"], !env.isEmpty {
+            return env
+        }
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/nova/novahomekit-token")
+        if let t = try? String(contentsOf: url, encoding: .utf8) {
+            let s = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !s.isEmpty { return s }
+        }
+        NSLog("[NovaHomeKit] WARNING: no API token configured — all requests will be rejected")
+        return ""
+    }()
+
+    private static func authorized(_ header: String?) -> Bool {
+        guard !expectedToken.isEmpty else { return false }   // fail closed
+        guard let header = header, header.hasPrefix("Bearer ") else { return false }
+        let presented = Array(String(header.dropFirst("Bearer ".count)).utf8)
+        let expected = Array(expectedToken.utf8)
+        guard presented.count == expected.count else { return false }
+        var diff: UInt8 = 0
+        for i in 0..<expected.count { diff |= presented[i] ^ expected[i] }
+        return diff == 0
+    }
+
+    private static func isAllowedHost(_ host: String?) -> Bool {
+        guard let host = host?.lowercased() else { return false }
+        let name = host.split(separator: ":").first.map(String.init) ?? host
+        return name == "127.0.0.1" || name == "localhost"
     }
 }
 
